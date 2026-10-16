@@ -59,8 +59,11 @@ See [architecture](docs/architecture/overview.md), [operations](docs/operations/
 [security](docs/security/overview.md), [development](docs/development/README.md), and the
 [ADR index](docs/architecture/adr/README.md).
 
-This package is pre-alpha. Browser/codec interoperability, TURN/TLS, NAT reachability, ingress,
-load/soak, and release provenance remain open gates. It does not implement an SFU, rooms, recording,
-transcoding, or cross-instance coordination.
+This is a **v0.1.0-alpha review candidate**. On Go 1.24.0, all eleven test groups pass, including
+the loopback peer/data-channel round trip, bounded peer admission, lifecycle shutdown, and SDP limits.
+Package statement coverage is 76.0% against a 75% CI floor; race detection, `go vet`, and `go build`
+also pass. Browser/codec interoperability, TURN/TLS, NAT reachability, ingress, load/soak, and
+release provenance remain open gates. The local source is not a published or tagged release. It does
+not implement an SFU, rooms, recording, transcoding, or cross-instance coordination.
 
 Licensed under Apache-2.0.
