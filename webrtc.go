@@ -2,10 +2,12 @@
 package webrtc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,41 +23,63 @@ import (
 const MaxSignalBytes = 256 * 1024
 
 var (
-	ErrConfig   = errors.New("invalid WebRTC server configuration")
+	// ErrConfig indicates invalid WebRTC server configuration.
+	ErrConfig = errors.New("invalid WebRTC server configuration")
+	// ErrProtocol indicates invalid or unsupported signaling input.
 	ErrProtocol = errors.New("invalid WebRTC signaling message")
 )
 
 // ICEConfig defines one explicit STUN/TURN service. String methods never reveal credentials.
 type ICEConfig struct {
-	URLs       []string
-	Username   string
+	// URLs lists bounded STUN/TURN endpoints without embedded user information.
+	URLs []string
+	// Username is the optional TURN username; it must be paired with Credential.
+	Username string
+	// Credential is the optional TURN secret and is omitted from formatted output.
 	Credential string
 }
 
+// String reports whether credentials are configured without revealing them.
 func (c ICEConfig) String() string {
 	return fmt.Sprintf("ICEConfig{url_count:%d credentials_configured:%t}", len(c.URLs), c.Credential != "")
 }
 
+// GoString keeps formatted ICE configuration from revealing credentials.
 func (c ICEConfig) GoString() string { return c.String() }
 
 // Config controls signaling and bounds peer resources.
 type Config struct {
-	Address          string
-	Path             string
-	AllowedOrigins   []string
-	ICEServers       []ICEConfig
-	MaxPeers         int
+	// Address is the HTTP listener address; NewConfig binds to loopback by default.
+	Address string
+	// Path is the exact WebSocket signaling route.
+	Path string
+	// AllowedOrigins lists exact HTTP(S) browser origins; an empty list allows originless clients only.
+	AllowedOrigins []string
+	// ICEServers supplies explicit STUN/TURN configuration for peer negotiation.
+	ICEServers []ICEConfig
+	// MaxPeers bounds active peer connections.
+	MaxPeers int
+	// MaxMediaSections bounds the media sections accepted in an offer.
 	MaxMediaSections int
-	MaxDataChannels  int
-	MaxSDPBytes      int
-	OfferTimeout     time.Duration
-	ShutdownTimeout  time.Duration
-	Authorize        func(*http.Request) error
-	OnPeer           func(*pion.PeerConnection)
-	OnTrack          func(*pion.TrackRemote, *pion.RTPReceiver)
-	OnDataChannel    func(*pion.DataChannel)
+	// MaxDataChannels bounds data channels per peer.
+	MaxDataChannels int
+	// MaxSDPBytes bounds an incoming or outgoing session description.
+	MaxSDPBytes int
+	// OfferTimeout bounds offer processing and peer negotiation setup.
+	OfferTimeout time.Duration
+	// ShutdownTimeout bounds graceful peer and listener shutdown.
+	ShutdownTimeout time.Duration
+	// Authorize optionally rejects an HTTP request before the WebSocket upgrade.
+	Authorize func(*http.Request) error
+	// OnPeer receives each new peer connection for application-owned signaling policy.
+	OnPeer func(*pion.PeerConnection)
+	// OnTrack receives remote media tracks; the application owns their processing and forwarding.
+	OnTrack func(*pion.TrackRemote, *pion.RTPReceiver)
+	// OnDataChannel receives negotiated data channels for application-owned message handling.
+	OnDataChannel func(*pion.DataChannel)
 }
 
+// NewConfig returns loopback-only defaults with finite peer, message, and timeout bounds.
 func NewConfig() Config {
 	return Config{
 		Address:          "127.0.0.1:8767",
@@ -70,7 +94,7 @@ func NewConfig() Config {
 }
 
 func (c Config) validate() error {
-	if _, _, err := net.SplitHostPort(c.Address); err != nil || !strings.HasPrefix(c.Path, "/") || strings.ContainsAny(c.Path, "?#") {
+	if _, _, err := net.SplitHostPort(c.Address); err != nil || len(c.Address) > 255 || strings.ContainsAny(c.Address, "\r\n\t ") || !strings.HasPrefix(c.Path, "/") || len(c.Path) > 1024 || strings.ContainsAny(c.Path, "?#\\\r\n\t") {
 		return fmt.Errorf("%w: address or path is invalid", ErrConfig)
 	}
 	if c.MaxPeers < 1 || c.MaxPeers > 4096 || c.MaxMediaSections < 1 || c.MaxMediaSections > 64 || c.MaxDataChannels < 1 || c.MaxDataChannels > 256 || c.MaxSDPBytes < 1024 || c.MaxSDPBytes > MaxSignalBytes {
@@ -81,17 +105,36 @@ func (c Config) validate() error {
 			return fmt.Errorf("%w: timeout is outside supported range", ErrConfig)
 		}
 	}
+	if len(c.AllowedOrigins) > 64 || len(c.ICEServers) > 16 {
+		return fmt.Errorf("%w: origin or ICE server list exceeds its limit", ErrConfig)
+	}
+	seenOrigins := make(map[string]struct{}, len(c.AllowedOrigins))
 	for _, origin := range c.AllowedOrigins {
+		if len(origin) == 0 || len(origin) > 512 || !isASCIIPrintable(origin) {
+			return fmt.Errorf("%w: origins must be bounded printable ASCII values", ErrConfig)
+		}
 		u, err := url.Parse(origin)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" || strings.Contains(u.Hostname(), "*") || strings.HasSuffix(u.Host, ":") || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 			return fmt.Errorf("%w: origins must be exact HTTP(S) origins", ErrConfig)
 		}
+		port := u.Port()
+		if port == "80" && u.Scheme == "http" || port == "443" && u.Scheme == "https" {
+			port = ""
+		}
+		key := strings.ToLower(u.Scheme+"://"+u.Hostname()) + ":" + port
+		if _, exists := seenOrigins[key]; exists {
+			return fmt.Errorf("%w: origins must be unique", ErrConfig)
+		}
+		seenOrigins[key] = struct{}{}
 	}
 	for _, server := range c.ICEServers {
-		if len(server.URLs) == 0 || (server.Username == "") != (server.Credential == "") {
+		if len(server.URLs) == 0 || len(server.URLs) > 16 || (server.Username == "") != (server.Credential == "") || len(server.Username) > 1024 || len(server.Credential) > 4096 || !isControlFree(server.Username) || !isControlFree(server.Credential) {
 			return fmt.Errorf("%w: ICE URL and credential settings are incomplete", ErrConfig)
 		}
 		for _, raw := range server.URLs {
+			if len(raw) == 0 || len(raw) > 2048 || !isASCIIPrintable(raw) {
+				return fmt.Errorf("%w: ICE URLs must be bounded printable ASCII values", ErrConfig)
+			}
 			u, err := url.Parse(raw)
 			if err != nil || (u.Scheme != "stun" && u.Scheme != "stuns" && u.Scheme != "turn" && u.Scheme != "turns") || u.Opaque == "" && u.Host == "" || u.User != nil {
 				return fmt.Errorf("%w: ICE URLs must use STUN/TURN schemes without embedded credentials", ErrConfig)
@@ -101,12 +144,31 @@ func (c Config) validate() error {
 	return nil
 }
 
+func isASCIIPrintable(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x21 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func isControlFree(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 type signalMessage struct {
 	Version int    `json:"v"`
 	Type    string `json:"type"`
 	SDP     string `json:"sdp"`
 }
 
+// Server owns active signaling sessions and peer connections until Close completes.
 type Server struct {
 	config   Config
 	mu       sync.Mutex
@@ -122,6 +184,7 @@ type peerLease struct {
 	pc   *pion.PeerConnection
 }
 
+// NewServer validates and snapshots config before creating the peer-capacity limiter.
 func NewServer(config Config) (*Server, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
@@ -134,22 +197,18 @@ func NewServer(config Config) (*Server, error) {
 	return &Server{config: config, active: make(map[*peerLease]struct{}), slots: make(chan struct{}, config.MaxPeers)}, nil
 }
 
-// Handler returns a mountable HTTP handler for the configured signaling path.
+// Handler returns a mountable HTTP handler for the signaling path. It checks the
+// exact browser-origin allowlist and optional authorization callback before upgrading.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != s.config.Path {
 			http.NotFound(w, r)
 			return
 		}
-		if !s.originAllowed(r.Header.Get("Origin")) {
+		origins := r.Header.Values("Origin")
+		if len(origins) > 1 || len(origins) == 1 && !s.originAllowed(origins[0]) {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
-		}
-		if s.config.Authorize != nil {
-			if err := s.config.Authorize(r); err != nil {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
 		}
 		select {
 		case s.slots <- struct{}{}:
@@ -157,7 +216,20 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "peer capacity reached", http.StatusServiceUnavailable)
 			return
 		}
-		// The explicit exact-origin check above runs before Accept; skip its broader host fallback.
+		slotHeld := true
+		defer func() {
+			if slotHeld {
+				<-s.slots
+			}
+		}()
+		if s.config.Authorize != nil {
+			if err := s.config.Authorize(r); err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		// The scheme, host, and port allowlist above is authoritative. Disable the library's
+		// same-host fallback because approved browser origins may arrive through a reverse proxy.
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true, CompressionMode: websocket.CompressionDisabled})
 		if err != nil {
 			<-s.slots
@@ -173,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 		lease := &peerLease{conn: conn}
 		s.active[lease] = struct{}{}
 		s.activeWG.Add(1)
+		slotHeld = false
 		s.mu.Unlock()
 		defer s.release(lease)
 		s.handle(r.Context(), lease)
@@ -200,14 +273,22 @@ func (s *Server) handle(ctx context.Context, lease *peerLease) {
 		_ = lease.conn.Close(websocket.StatusPolicyViolation, "invalid offer")
 		return
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 3 || fields["v"] == nil || fields["type"] == nil || fields["sdp"] == nil {
+	fields, err := decodeUniqueObject(raw)
+	if err != nil || len(fields) != 3 || fields["v"] == nil || fields["type"] == nil || fields["sdp"] == nil {
 		_ = lease.conn.Close(websocket.StatusPolicyViolation, "invalid offer")
 		return
 	}
 	var message signalMessage
 	if err := json.Unmarshal(raw, &message); err != nil || message.Version != 1 || message.Type != "offer" || message.SDP == "" || len(message.SDP) > s.config.MaxSDPBytes {
 		_ = lease.conn.Close(websocket.StatusPolicyViolation, "invalid offer")
+		return
+	}
+	mediaSections := strings.Count(message.SDP, "\nm=")
+	if strings.HasPrefix(message.SDP, "m=") {
+		mediaSections++
+	}
+	if mediaSections > s.config.MaxMediaSections {
+		_ = lease.conn.Close(websocket.StatusPolicyViolation, "media section limit exceeded")
 		return
 	}
 	servers := make([]pion.ICEServer, 0, len(s.config.ICEServers))
@@ -282,6 +363,10 @@ func (s *Server) handle(ctx context.Context, lease *peerLease) {
 		return
 	}
 	response, _ := json.Marshal(signalMessage{Version: 1, Type: "answer", SDP: local.SDP})
+	if len(response) > MaxSignalBytes {
+		_ = lease.conn.Close(websocket.StatusMessageTooBig, "answer exceeds signaling limit")
+		return
+	}
 	if err := lease.conn.Write(ctx, websocket.MessageText, response); err != nil {
 		return
 	}
@@ -290,15 +375,47 @@ func (s *Server) handle(ctx context.Context, lease *peerLease) {
 		if readErr != nil {
 			return
 		}
-		var control map[string]json.RawMessage
+		control, decodeErr := decodeUniqueObject(data)
 		var version int
 		var typ string
-		if json.Unmarshal(data, &control) != nil || len(control) != 2 || json.Unmarshal(control["v"], &version) != nil || json.Unmarshal(control["type"], &typ) != nil || version != 1 || typ != "close" {
+		if decodeErr != nil || len(control) != 2 || control["v"] == nil || control["type"] == nil || json.Unmarshal(control["v"], &version) != nil || json.Unmarshal(control["type"], &typ) != nil || version != 1 || typ != "close" {
 			_ = lease.conn.Close(websocket.StatusPolicyViolation, "unsupported signaling message")
 			return
 		}
 		return
 	}
+}
+
+func decodeUniqueObject(raw []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, ErrProtocol
+	}
+	fields := make(map[string]json.RawMessage, 3)
+	for decoder.More() {
+		token, tokenErr := decoder.Token()
+		key, ok := token.(string)
+		if tokenErr != nil || !ok {
+			return nil, ErrProtocol
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, ErrProtocol
+		}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return nil, ErrProtocol
+		}
+		fields[key] = value
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, ErrProtocol
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, ErrProtocol
+	}
+	return fields, nil
 }
 
 func (s *Server) release(lease *peerLease) {
